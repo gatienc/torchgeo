@@ -72,6 +72,7 @@ from .eurosat import EuroSAT, EuroSAT100, EuroSATSpatial
 from .everwatch import EverWatch
 from .fair1m import FAIR1M
 from .fire_risk import FireRisk
+from .flairhub import FLAIRHUB, FLAIRHUBToy
 from .forestdamage import ForestDamage
 from .ftw import FieldsOfTheWorld
 from .gbif import GBIF
