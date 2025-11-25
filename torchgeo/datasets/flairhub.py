@@ -7,6 +7,7 @@ import glob
 import json
 import os
 from collections.abc import Callable, Collection, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, ClassVar, cast, Literal
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -474,12 +475,13 @@ class FLAIRHUB(NonGeoDataset):
             index: index to return
 
         Returns:
-            image and mask at that index with image of dimension `get_num_bands()`x512x512,
-            sentinel image of dimension Tx10x512x512 and mask of dimension 512x512
+            dictionary containing tensors for each modality
+            keys are the modality names : 'mask', 'aerial_rgbi', 'aerial_rlt_pan', 'spot_rgbi', 'dem_elev', 'sentinel2_ts', 'sentinel1_asc_ts', 'sentinel1_desc_ts'
         """
         
         sample = self.files[index]
-
+        if self.transforms is not None:
+            sample = self.transforms(sample)
         return sample
 
     def __len__(self) -> int:
@@ -534,14 +536,7 @@ class FLAIRHUB(NonGeoDataset):
         pattern = f'*/*_{label_modality}/*/*.tif'
         label_paths = list(self.root.glob(pattern))
         
-        if not label_paths:
-            # Try alternative structure (extracted directly in root)
-            for domain, years in self.domain_years.items():
-                for year in years:
-                    domain_year = f"{domain}-{year}"
-                    pattern = f'{domain_year}_{label_modality}/*/*.tif'
-                    label_paths.extend(self.root.glob(pattern))
-        
+
         if not label_paths:
             raise FileNotFoundError(
                 f"No label files found in {self.root}. "
@@ -716,8 +711,18 @@ class FLAIRHUB(NonGeoDataset):
         # Extract any zips that exist but haven't been extracted
         if to_extract:
             print(f"Extracting {len(to_extract)} modality archives...")
-            for domain, year, modality in to_extract:
-                self._extract(domain, year, modality)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {
+                    executor.submit(self._extract, domain, year, modality): (domain, year, modality)
+                    for domain, year, modality in to_extract
+                }
+                for future in as_completed(futures):
+                    domain, year, modality = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Error extracting {domain}-{year}_{modality}: {e}")
+                        raise
         
         # Download any missing files
         if to_download:
@@ -725,10 +730,18 @@ class FLAIRHUB(NonGeoDataset):
                 print(f"Missing {len(to_download)} modality archives. Set download=True to download them.")
                 raise DatasetNotFoundError(self)
             
-            print(f"Downloading {len(to_download)} modality archives from HuggingFace...")
-            for domain, year, modality in to_download:
-                self._download(domain, year, modality)
-                self._extract(domain, year, modality)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {
+                    executor.submit(self._download_and_extract, domain, year, modality): (domain, year, modality)
+                    for domain, year, modality in to_download
+                }
+                for future in as_completed(futures):
+                    domain, year, modality = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Error downloading/extracting {domain}-{year}_{modality}: {e}")
+                        raise
         
         if not to_download and not to_extract:
             print('All requested modalities are already downloaded and extracted.')
@@ -744,18 +757,23 @@ class FLAIRHUB(NonGeoDataset):
         filename = f"{domain}-{year}_{modality}.zip"
         url = f"{self.url_base}/{filename}"
         
-        print(f"Downloading {filename}...")
-        try:
-            download_url(
-                url,
-                str(self.root),
-                filename=filename,
-                md5=None,  # No checksums available
-            )
-            print(f"Successfully downloaded {filename}")
-        except Exception as e:
-            print(f"Error downloading {filename}: {e}")
-            raise
+        download_url(
+            url,
+            str(self.root),
+            filename=filename,
+            md5=None,  # No checksums available
+        )
+
+    def _download_and_extract(self, domain: str, year: str, modality: str) -> None:
+        """Download and extract a specific modality file from HuggingFace.
+        
+        Args:
+            domain: Domain identifier (e.g., 'D004')
+            year: Year or '195X' for historical data
+            modality: Modality suffix (e.g., 'AERIAL_RGBI')
+        """
+        self._download(domain, year, modality)
+        self._extract(domain, year, modality)
 
     def _extract(self, domain: str, year: str, modality: str) -> None:
         """Extract a specific modality archive and delete the zip file.
@@ -771,18 +789,10 @@ class FLAIRHUB(NonGeoDataset):
         if not zipfile_path.is_file():
             raise FileNotFoundError(f"Archive not found: {zipfile_path}")
         
-        print(f"Extracting {filename}...")
-        try:
-            extract_archive(str(zipfile_path), str(self.root))
-            print(f"Successfully extracted {filename}")
-            
-            # Delete the zip file after successful extraction to save disk space
-            zipfile_path.unlink()
-            print(f"Deleted {filename} (archive no longer needed)")
-        except Exception as e:
-            print(f"Error extracting {filename}: {e}")
-            raise
-
+        extract_archive(str(zipfile_path), str(self.root))
+        
+        zipfile_path.unlink()
+       
     def _plot_mask(self, mask: np.ndarray, ax: plt.Axes, show_legend: bool = True) -> None:
         """Plot a label mask with appropriate colormap.
         
@@ -800,9 +810,8 @@ class FLAIRHUB(NonGeoDataset):
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
         
-        # Rasterio reads masks as (C, H, W), convert to (H, W) for matplotlib
-        if mask.ndim == 3:
-            mask = mask[0]  # Take first channel: (1, H, W) -> (H, W)
+
+        mask = mask[0]  # Take first channel: (1, H, W) -> (H, W)
         
         n_classes = len(class_names)
         bounds = np.arange(n_classes + 1) - 0.5
@@ -898,57 +907,81 @@ class FLAIRHUB(NonGeoDataset):
             a matplotlib Figure with the rendered sample
         """
         # Collect all available modalities to plot
-        plot_data = []
+        plot_data: dict[str, dict[str, Any]] = {}
         
         # Always plot the mask
         if 'mask' in sample:
             with rasterio.open(sample["mask"]) as f:
                 mask = f.read()
-            plot_data.append(('mask', mask, 'mask'))
+            plot_data['mask'] = {
+                'plot_type': 'mask',
+                'data': mask,
+                'title': 'mask'
+            }
         
         # Plot aerial RGBI if available
         if 'aerial_rgbi' in sample:
             with rasterio.open(sample["aerial_rgbi"]) as f:
                 aerial_rgbi = f.read()
             rgb_indices = [0, 1, 2]  # R, G, B bands
-            plot_data.append(('rgb', aerial_rgbi, 'Aerial RGBI', rgb_indices))
+            plot_data['aerial_rgbi'] = {
+                'plot_type': 'rgb',
+                'data': aerial_rgbi,
+                'title': 'Aerial RGBI',
+                'rgb_indices': rgb_indices
+            }
         
         # Plot SPOT RGBI if available
         if 'spot_rgbi' in sample:
             with rasterio.open(sample["spot_rgbi"]) as f:
                 spot_rgbi = f.read()
             rgb_indices = [0, 1, 2]  # R, G, B bands
-            plot_data.append(('rgb', spot_rgbi, 'SPOT RGBI', rgb_indices))
+            plot_data['spot_rgbi'] = {
+                'plot_type': 'rgb',
+                'data': spot_rgbi,
+                'title': 'SPOT RGBI',
+                'rgb_indices': rgb_indices
+            }
         
         # Plot historical aerial panchromatic if available
         if 'aerial_rlt_pan' in sample:
             with rasterio.open(sample["aerial_rlt_pan"]) as f:
                 aerial_rlt = f.read()
-            plot_data.append(('grayscale', aerial_rlt, 'Historical Aerial'))
+            plot_data['aerial_rlt_pan'] = {
+                'plot_type': 'grayscale',
+                'data': aerial_rlt,
+                'title': 'Historical Aerial'
+            }
         
         # Plot DEM if available
         if 'dem_elev' in sample:
             with rasterio.open(sample["dem_elev"]) as f:
                 dem = f.read()
-            plot_data.append(('dem', dem, 'DEM Elevation'))
+            plot_data['dem_elev'] = {
+                'plot_type': 'dem',
+                'data': dem,
+                'title': 'DEM Elevation'
+            }
         
         # Plot Sentinel-1 Ascending if available
         if 'sentinel1_asc_ts' in sample:
             with rasterio.open(sample["sentinel1_asc_ts"]) as f:
                 s1_asc = f.read()
-            # Use first time step and VV band for visualization
-            if s1_asc.ndim == 3:
-                s1_asc = s1_asc[0:1]  # First band
-            plot_data.append(('grayscale', s1_asc, 'Sentinel-1 ASC'))
+            plot_data['sentinel1_asc_ts'] = {
+                'plot_type': 'grayscale',
+                'data': s1_asc,
+                'title': 'Sentinel-1 ASC'
+            }
         
         # Plot Sentinel-1 Descending if available
         if 'sentinel1_desc_ts' in sample:
             with rasterio.open(sample["sentinel1_desc_ts"]) as f:
                 s1_desc = f.read()
-            # Use first time step and VV band for visualization
-            if s1_desc.ndim == 3:
-                s1_desc = s1_desc[0:1]  # First band
-            plot_data.append(('grayscale', s1_desc, 'Sentinel-1 DESC'))
+            plot_data['sentinel1_desc_ts'] = {
+                'plot_type': 'grayscale',
+                'data': s1_desc,
+                'title': 'Sentinel-1 DESC'
+            }
         
         # Plot Sentinel-2 time series if available
         if 'sentinel2_ts' in sample:
@@ -959,23 +992,46 @@ class FLAIRHUB(NonGeoDataset):
             num_bands = s2_ts.shape[0]
             if num_bands >= 4:
                 rgb_indices = [3, 2, 1]  # R, G, B for full 12-band data
-                plot_data.append(('rgb', s2_ts, 'Sentinel-2 TS', rgb_indices))
+                plot_data['sentinel2_ts'] = {
+                    'plot_type': 'rgb',
+                    'data': s2_ts,
+                    'title': 'Sentinel-2 TS',
+                    'rgb_indices': rgb_indices
+                }
             elif num_bands == 3:
                 rgb_indices = [0, 1, 2]  # Already RGB format
-                plot_data.append(('rgb', s2_ts, 'Sentinel-2 TS', rgb_indices))
+                plot_data['sentinel2_ts'] = {
+                    'plot_type': 'rgb',
+                    'data': s2_ts,
+                    'title': 'Sentinel-2 TS',
+                    'rgb_indices': rgb_indices
+                }
             elif num_bands == 1:
                 # Single band - display as grayscale
-                plot_data.append(('grayscale', s2_ts, 'Sentinel-2 TS'))
+                plot_data['sentinel2_ts'] = {
+                    'plot_type': 'grayscale',
+                    'data': s2_ts,
+                    'title': 'Sentinel-2 TS'
+                }
             else:
                 # Other configurations - use first 3 bands as RGB
                 rgb_indices = [0, 1, 2]
-                plot_data.append(('rgb', s2_ts, 'Sentinel-2 TS', rgb_indices))
+                plot_data['sentinel2_ts'] = {
+                    'plot_type': 'rgb',
+                    'data': s2_ts,
+                    'title': 'Sentinel-2 TS',
+                    'rgb_indices': rgb_indices
+                }
         
         # Plot Sentinel-2 mask if available
         if 'sentinel2_msk_sc' in sample:
             with rasterio.open(sample["sentinel2_msk_sc"]) as f:
                 s2_msk = f.read()
-            plot_data.append(('grayscale', s2_msk, 'Sentinel-2 Mask'))
+            plot_data['sentinel2_msk_sc'] = {
+                'plot_type': 'grayscale',
+                'data': s2_msk,
+                'title': 'Sentinel-2 Mask'
+            }
         
         # Create figure with appropriate size
         num_plots = len(plot_data)
@@ -990,15 +1046,20 @@ class FLAIRHUB(NonGeoDataset):
         axs = axs.flatten()
         
         # Plot each modality
-        for idx, plot_info in enumerate(plot_data):
-            if plot_info[0] == 'mask':
-                self._plot_mask(plot_info[1], axs[idx], show_legend=(idx == 0))
-            elif plot_info[0] == 'rgb':
-                self._plot_rgb_modality(plot_info[1], axs[idx], plot_info[2], plot_info[3])
-            elif plot_info[0] == 'grayscale':
-                self._plot_grayscale_modality(plot_info[1], axs[idx], plot_info[2])
-            elif plot_info[0] == 'dem':
-                self._plot_dem(plot_info[1], axs[idx], plot_info[2])
+        for idx, (imagery_key, plot_info) in enumerate(plot_data.items()):
+            plot_type = plot_info['plot_type']
+            data = plot_info['data']
+            title = plot_info['title']
+            
+            if plot_type == 'mask':
+                self._plot_mask(data, axs[idx], show_legend=(idx == 0))
+            elif plot_type == 'rgb':
+                rgb_indices = plot_info['rgb_indices']
+                self._plot_rgb_modality(data, axs[idx], title, rgb_indices)
+            elif plot_type == 'grayscale':
+                self._plot_grayscale_modality(data, axs[idx], title)
+            elif plot_type == 'dem':
+                self._plot_dem(data, axs[idx], title)
         
         # Hide unused subplots
         for idx in range(num_plots, len(axs)):
@@ -1261,3 +1322,5 @@ class FLAIRHUBToy(FLAIRHUB):
         zipfile = Path(self.root) / self.download_link.split('/')[-1]
         assert zipfile.is_file()
         extract_archive(zipfile)
+        zipfile.unlink()
+        print(f"Toy dataset extracted and deleted.")
